@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LedShow Controller — Web Bluetooth</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">Led<span>Show</span></div>
+  <div class="header-center">
+    <div id="conn-status">
+      <div id="conn-dot"></div>
+      <span id="conn-txt">not connected</span>
+    </div>
+  </div>
+  <button class="btn-connect" id="btn-conn">CONNECT</button>
+</header>
+
+<div id="no-bt-warning">⚠ Web Bluetooth isn't available here. Use Chrome or Edge, over HTTPS (or localhost), on desktop or Android.</div>
+
+<div id="preview-area">
+  <div id="preview-wrap">
+    <canvas id="preview-canvas"></canvas>
+    <span class="preview-label">12 × 48</span>
+  </div>
+</div>
+
+<div id="tabs-area">
+  <div id="tab-panels">
+
+    <!-- TEXT -->
+    <div class="tab-panel active" id="panel-text">
+      <div>
+        <div class="section-title">Message</div>
+        <textarea id="text-input" rows="2" placeholder="Type your message…"></textarea>
+      </div>
+      <div>
+        <div class="section-title">Effect</div>
+        <div class="pill-row" id="text-effect-row"></div>
+      </div>
+      <div class="settings-card">
+        <div class="checkbox-row">
+          <label for="chk-live-scroll">Software scroll (loops on-device, works with any text/font)</label>
+          <input type="checkbox" id="chk-live-scroll">
+        </div>
+        <div class="slider-row" id="scroll-speed-row" style="display:none">
+          <div class="slider-label"><span>Scroll speed</span><span id="lbl-scroll-speed">80ms/step</span></div>
+          <input type="range" min="20" max="300" step="10" value="80" id="sl-scroll-speed">
+        </div>
+      </div>
+      <div class="settings-card">
+        <div class="section-title">Settings</div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-text-bright">180</span></div>
+          <input type="range" min="0" max="255" value="180" id="sl-text-bright">
+        </div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Device speed</span><span id="lbl-text-speed">100</span></div>
+          <input type="range" min="0" max="255" value="100" id="sl-text-speed">
+        </div>
+      </div>
+      <button class="send-btn" id="btn-send-text" disabled>▶ SEND</button>
+    </div>
+
+    <!-- FREE DRAW -->
+    <div class="tab-panel" id="panel-draw">
+      <div>
+        <div class="section-title">Draw (12 × 48) — sent to the badge live as you draw</div>
+        <div id="draw-canvas-wrap"><canvas id="draw-canvas" width="48" height="12"></canvas></div>
+      </div>
+      <div class="tool-row">
+        <button class="tool-btn active" id="tool-draw">✏ Draw</button>
+        <button class="tool-btn" id="tool-erase">◻ Erase</button>
+        <button class="tool-btn" id="tool-clear">✕ Clear</button>
+        <button class="tool-btn" id="tool-invert">⇄ Invert</button>
+        <button class="tool-btn" id="tool-save">⬇ Save PNG</button>
+        <label class="tool-btn" style="margin:0">⬆ Load PNG<input type="file" id="load-png" accept="image/*" style="display:none"></label>
+      </div>
+      <div>
+        <div class="section-title">Display effect</div>
+        <div class="pill-row" id="draw-effect-row"></div>
+      </div>
+      <div class="settings-card">
+        <div class="section-title">Settings</div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-draw-bright">180</span></div>
+          <input type="range" min="0" max="255" value="180" id="sl-draw-bright">
+        </div>
+      </div>
+      <button class="send-btn" id="btn-send-draw" disabled>▶ Apply effect</button>
+    </div>
+
+    <!-- ANIMATIONS -->
+    <div class="tab-panel" id="panel-anim">
+      <div>
+        <div class="section-title">Built-in animations — tap to play instantly</div>
+        <div class="anim-grid" id="anim-grid"></div>
+      </div>
+      <div class="settings-card">
+        <div class="section-title">Settings</div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-anim-bright">180</span></div>
+          <input type="range" min="0" max="255" value="180" id="sl-anim-bright">
+        </div>
+      </div>
+    </div>
+
+    <!-- MUSIC -->
+    <div class="tab-panel" id="panel-music">
+      <div>
+        <div class="section-title">Audio source</div>
+        <div class="music-src-row">
+          <button class="music-btn" id="btn-mic">🎙 Microphone</button>
+          <button class="music-btn" id="btn-file">🎵 Audio file</button>
+          <input type="file" id="music-file" accept="audio/*">
+        </div>
+      </div>
+      <div>
+        <div class="section-title">Live spectrogram</div>
+        <canvas id="fft-bar-canvas" width="48" height="12"></canvas>
+      </div>
+      <div class="settings-card">
+        <div class="section-title">Settings</div>
+        <div>
+          <div class="section-title" style="margin-bottom:6px">Visualization mode</div>
+          <div class="pill-row">
+            <div class="pill" data-vis="bottom" onclick="setVisualization(this)">Bottom</div>
+            <div class="pill active" data-vis="center" onclick="setVisualization(this)">Center</div>
+          </div>
+        </div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Sensitivity</span><span id="lbl-music-gain">5</span></div>
+          <input type="range" min="1" max="10" value="5" id="sl-music-gain">
+        </div>
+      </div>
+      <button class="send-btn stop" id="btn-stop-music" style="display:none">■ STOP</button>
+    </div>
+
+    <!-- HELP -->
+    <div class="tab-panel" id="panel-help">
+      <div class="section-title">About this app</div>
+      <div class="help-text">
+        <p><b>Requirements:</b> Chrome or Edge, desktop or Android, served over <b>HTTPS or localhost</b> (Web Bluetooth won't work over plain http:// or on iOS Safari).</p>
+        <br>
+        <p><b>Protocol:</b> this talks directly to the badge's GATT service (advertised UUID <span style="color:var(--text)">0xFFE0</span>) using the write characteristic <span style="color:var(--text)">0xA951</span> for commands and <span style="color:var(--text)">0xA952</span> for brightness/speed buffers, exactly as reverse-engineered in your <span style="color:var(--text)">pyHack.py</span> capture.</p>
+        <br>
+        <p><b>Text & Free Draw</b> both work by rasterizing content to a 12×48 bitmap in the browser and pushing it pixel-by-pixel through Free Draw mode (<span style="color:var(--text)">0x0301…</span> + per-pixel <span style="color:var(--text)">0x0302…</span> writes) — the same mechanism your pyFreeDraw.py used. The device's own proprietary "upload custom font" packet format (seen commented out in pyHack.py) wasn't fully reverse-engineered, so it isn't used here; instead, long text can be scrolled from the browser side by re-sending shifted frames — enable <b>"Software scroll"</b> on the Text tab.</p>
+        <br>
+        <p><b>Animations</b> (0–18) and the <b>Audio Spectrogram</b> mode use the manufacturer's built-in device commands directly.</p>
+        <br>
+        <p>Free Draw sends ~576 individual BLE writes per frame (one per pixel), so each send takes a couple of seconds — this matches the timing your original scripts used.</p>
+      </div>
+    </div>
+
+  </div>
+
+  <div id="tab-bar">
+    <button class="tab-btn active" data-tab="text"><span class="tab-icon">T</span>Text</button>
+    <button class="tab-btn" data-tab="draw"><span class="tab-icon">✎</span>Draw</button>
+    <button class="tab-btn" data-tab="anim"><span class="tab-icon">★</span>Anim</button>
+    <button class="tab-btn" data-tab="music"><span class="tab-icon">♫</span>Music</button>
+    <button class="tab-btn" data-tab="help"><span class="tab-icon">?</span>Help</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="static/ledshow.js"></script>
+<script src="static/blebadge.js"></script>
+</body>
+</html>

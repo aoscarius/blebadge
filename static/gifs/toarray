@@ -1,0 +1,13 @@
+#!/bin/bash
+
+OUT_FILE=".giflist"
+
+echo "const ANIM_GIFS = {" > ${OUT_FILE}
+for i in {0..18}; do
+    FILE="${i}.gif"
+    if [ -f "$FILE" ]; then
+        BASE64_CONTENT=$(base64 -w 0 "$FILE")
+        echo "  ${i}: \"data:image/gif;base64,${BASE64_CONTENT}\","
+    fi
+done >> ${OUT_FILE}
+echo "};" >> ${OUT_FILE}
