@@ -43,16 +43,6 @@
         <div class="pill-row" id="text-effect-row"></div>
       </div>
       <div class="settings-card">
-        <div class="checkbox-row">
-          <label for="chk-live-scroll">Software scroll (loops on-device, works with any text/font)</label>
-          <input type="checkbox" id="chk-live-scroll">
-        </div>
-        <div class="slider-row" id="scroll-speed-row" style="display:none">
-          <div class="slider-label"><span>Scroll speed</span><span id="lbl-scroll-speed">80ms/step</span></div>
-          <input type="range" min="20" max="300" step="10" value="80" id="sl-scroll-speed">
-        </div>
-      </div>
-      <div class="settings-card">
         <div class="section-title">Settings</div>
         <div class="slider-row">
           <div class="slider-label"><span>Brightness</span><span id="lbl-text-bright">180</span></div>
@@ -81,7 +71,7 @@
         <label class="tool-btn" style="margin:0">⬆ Load PNG<input type="file" id="load-png" accept="image/*" style="display:none"></label>
       </div>
       <div>
-        <div class="section-title">Display effect</div>
+        <div class="section-title">Effect</div>
         <div class="pill-row" id="draw-effect-row"></div>
       </div>
       <div class="settings-card">
@@ -89,6 +79,10 @@
         <div class="slider-row">
           <div class="slider-label"><span>Brightness</span><span id="lbl-draw-bright">180</span></div>
           <input type="range" min="0" max="255" value="180" id="sl-draw-bright">
+        </div>
+        <div class="slider-row">
+          <div class="slider-label"><span>Device speed</span><span id="lbl-draw-speed">100</span></div>
+          <input type="range" min="0" max="255" value="100" id="sl-draw-speed">
         </div>
       </div>
       <button class="send-btn" id="btn-send-draw" disabled>▶ Apply effect</button>
@@ -170,6 +164,7 @@
 <div id="toast"></div>
 
 <script src="static/ledshow.js"></script>
+<script src="static/gifs/gifs.js"></script>
 <script src="static/blebadge.js"></script>
 </body>
 </html>

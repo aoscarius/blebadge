@@ -1,6 +1,6 @@
 #!/bin/bash
 
-OUT_FILE=".giflist"
+OUT_FILE="gif.js"
 
 echo "const ANIM_GIFS = {" > ${OUT_FILE}
 for i in {0..18}; do

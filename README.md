@@ -102,11 +102,12 @@ test a raw hex payload before wrapping it in a proper method.
   scroll/animate natively on-device. That encoding hasn't been cracked yet —
   see `protocol.md` for the raw captures and what's known so far. Until then,
   text is rendered client-side and pushed through Free Draw mode instead.
-- **Spectrogram preview is an approximation.** The 10 bar values sent to the
-  device are real and match the confirmed protocol; how the badge itself
-  lays those 10 bars out physically (spacing, growth direction) varies by
-  firmware/hardware revision, so the in-browser preview is a best-effort
-  visual match, not a guaranteed pixel-perfect mirror.
+- **Spectrogram preview matches the device exactly, not just approximately.**
+  A real BLE capture confirmed the badge takes exactly 12 bar values (0–8)
+  plus a mode byte the device itself uses to choose between bottom-up and
+  center-symmetric rendering — so the app's "Bottom"/"Center" toggle tells
+  the physical badge which layout to draw natively, rather than being a
+  local-only preview choice.
 - Free Draw sends one BLE write per pixel (up to 576 per full frame), so a
   full-canvas redraw takes a couple of seconds — this is a hardware/protocol
   limit, not something the app can batch around.

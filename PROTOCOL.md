@@ -30,6 +30,18 @@ labeled as such rather than guessed silently.
 | `0000ae02-...` | — | Notify | Present on some units, purpose unconfirmed. Not used by this app. |
 | `00002a00-...` | `NAME` | Read/Write | Standard GATT Device Name characteristic. |
 
+**Observed but unused: an auth-looking handshake on `0xAE01`/`0xAE02`.**
+One capture shows an exchange on these two characteristics *before* any
+`CMD`/`BUFFER` traffic: a write to `0xAE01`, a notify back on `0xAE02`,
+then a write containing the literal ASCII bytes `70 61 73 73` (`"pass"`)
+prefixed with `02`, echoed back unchanged on the notify. This looks like
+some form of challenge/response using a fixed default "password" — typical
+of low-cost BLE devices with nominal pairing security. Every command in
+this document works over `CMD`/`BUFFER` without ever performing this
+handshake, so it doesn't appear to gate normal operation, but it's
+recorded here in case some other function (e.g. successfully triggering
+the bitmap-upload path) turns out to require it.
+
 **Important:** don't rely on a single "primary service" — some Web
 Bluetooth stacks only expose characteristics correctly when you enumerate
 *all* primary services on the connected GATT server and search across all
@@ -39,231 +51,317 @@ history / changelog if working from a fork.)
 
 ## Command packet format
 
-Every command observed on the `CMD` (`0xA951`) and `BUFFER` (`0xA952`)
-characteristics in this app is **exactly 16 bytes**, and looks like:
+Confirmed from a real BLE HCI snoop capture (100+ samples across every
+command type below, cross-checked byte-for-byte). Every command sent on
+either `CMD` (`0xA951`) or `BUFFER` (`0xA952`) uses the **same envelope**,
+with no fixed size and no zero-padding:
 
 ```
-byte:   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
-        [opcode-hi][opcode-lo][ param-hi ][ param-lo ][ ------ payload / padding ------ ]
+byte:    0        1        2      3      4 .. 4+N-1     4+N   5+N
+        [CMD_GRP][CMD_ID][   LEN (N), big-endian  ][   PAYLOAD (N bytes)   ][    CRC16    ]
 ```
 
-- **Bytes 0–1**: opcode. Byte 0 is a coarse "family" (draw/mode = `0x03`,
-  animation = `0x05`, spectrogram = `0x06`, brightness/speed/effect =
-  `0x00`), byte 1 selects the specific command within that family.
-- **Bytes 2–3**: a secondary parameter field. In several commands this
-  lines up with "how many of the following bytes are meaningful", but it
-  doesn't hold consistently across every command family (see `setEffect`
-  below), so **its exact semantics are not fully confirmed** — treat it as
-  command-specific until proven otherwise.
-- **Bytes 4–15**: payload, specific to each command, zero-padded to fill
-  the 16 bytes.
+- **Byte 0 (`CMD_GRP`)**: command group/family — `0x00`, `0x01`, `0x03`,
+  `0x04`, `0x05`, or `0x06` (see command reference below).
+- **Byte 1 (`CMD_ID`)**: sub-command within that group.
+- **Bytes 2–3 (`LEN`)**: payload length as a big-endian `uint16` — i.e.
+  byte 2 is the *high* byte (`00 0d` = 13, `00 01` = 1). An earlier draft
+  of this doc had this backwards as little-endian; every real captured
+  value only makes sense as big-endian once you check it against the
+  payload that actually follows.
+- **Bytes 4..4+N-1 (`PAYLOAD`)**: exactly `N` bytes, `N` = the `LEN` field.
+  No padding before or after — total packet size is always `6 + N` bytes.
+- **Last 2 bytes (`CRC16`)**: checksum over everything before it (bytes
+  `0` through `3+N`, i.e. `CMD_GRP`+`CMD_ID`+`LEN`+`PAYLOAD`), appended
+  **big-endian** (high byte first). This was the single biggest unlock in
+  this whole reverse-engineering effort — see below.
 
-All values below are hex, byte-separated for readability; `XX` marks a
-variable byte, `--` marks a byte whose value hasn't been shown to matter
-(commonly zero padding).
+### The CRC
 
-### `freeMode()` — enter Free Draw mode
+**CRC-16/MODBUS**: polynomial `0x8005` reflected (`0xA001`), init `0xFFFF`,
+no final XOR. Verified against every command type this library sends,
+including all 19 previously-mysterious per-animation "hash" values (see
+`animate()` below) and the previously-unexplained trailing bytes of the
+`Upload Start` command — both turned out to just be this same CRC, not
+opaque lookup data.
 
-```
-03 01 00 01 01 ac a1 00 00 00 00 00 00 00 00 00
-```
+Dependency-free JS implementation (see `ledshow.js`):
 
-- `03 01`: opcode = enter-mode.
-- `00 01`: param field.
-- `01`: mode selector (confirmed: `01` = Free Draw / pixel-grid mode).
-- `ac a1`: fixed 2-byte magic/id for this mode (unconfirmed whether it's a
-  checksum or just a mode identifier — it's constant across every capture
-  of this command).
-- rest: zero padding.
-
-Must be sent once before `drawPixel`/`drawFrame` calls.
-
-### `drawPixel(row, col, on)` — set/clear one pixel in Free Draw mode
-
-```
-03 02 00 03 MM 0R QC rr rr r0 00 00 00 00 00
-```
-
-- `03 02`: opcode = draw pixel.
-- `00 03`: param field (3 meaningful bytes follow: `MM`, `0R`, `QC`).
-- `MM`: `00` = light the pixel (drawn/red), `04` = clear it. **Confirmed.**
-- `0R`: high nibble always `0`, low nibble = **row** (0–11). Confirmed —
-  row is a single hex digit since the grid is only 12 rows tall.
-- `QC`: high nibble = **column group** (`col / 16`, range 0–2, since
-  48 columns / 16 = 3 groups of 16), low nibble = **column within group**
-  (`col % 16`, range 0–15). Confirmed by construction — this is how the
-  official app's captures decompose every column value 0–47.
-- `rr rr r`: a 5-hex-digit (20-bit) field immediately after `QC`, straddling
-  byte boundaries (bytes 7–9 above only align on a nibble). The original
-  reverse-engineering scripts (`pyHack.py`, `pyFreeDraw.py`) populate this
-  with **`random.randrange(16**5)`** on every single pixel write, and the
-  device accepts it fine regardless of value — so functionally this field
-  appears to be **ignored by the device** (or its real meaning is something
-  the badge doesn't validate, e.g. a sequence/frame id). Treat any value
-  here as safe; this library also just randomizes it, matching the known
-  working behavior.
-- remaining bytes: zero padding.
-
-To push a full frame, `drawFrame()` just calls `drawPixel()` for all
-12×48 = 576 cells in turn — there's no confirmed "bulk pixel" command, so a
-full redraw costs 576 individual BLE writes.
-
-### `animate(index)` — play a built-in animation (0–18)
-
-```
-05 03 00 04 II 01 64 64 HH HH 00 00 00 00 00 00
+```js
+function crc16modbus(bytes) {
+  let crc = 0xFFFF;
+  for (const b of bytes) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 1) ? ((crc >>> 1) ^ 0xA001) : (crc >>> 1);
+    }
+  }
+  return crc & 0xFFFF; // append as [ (crc>>8)&0xff, crc&0xff ] — high byte first
+}
 ```
 
-- `05 03`: opcode = play animation.
-- `00 04`: param field (4 meaningful bytes follow: `II`, `01`, `64`, `64`).
-- `II`: animation index, `00`–`12` hex (0–18 decimal). **Confirmed** —
-  directly the requested index, zero-padded to a byte.
-- `01 64 64`: constant across all 19 captured animation commands. Purpose
-  unconfirmed (possibly a fixed style/speed/repeat setting the official app
-  never varies).
-- `HH HH`: a 2-byte **per-animation hash/id**, one of 19 fixed values (see
-  `LedShow.ANIM_HASHES` in `ledshow.js`). **Confirmed required** — sending
-  the wrong hash for a given index was not tested and is assumed to fail or
-  play the wrong animation, since the official app always pairs each index
-  with its own specific hash. These 19 values were captured directly from
-  the official app's traffic and are not derivable from the index alone (no
-  arithmetic relationship found).
-- remaining bytes: zero padding.
+This one packet builder (`opcode(2) + len(2) + payload + crc(2)`) replaces
+what an earlier version of this doc described as fixed 16-byte
+zero-padded packets with "magic" constants. Those old captures (from
+`pyHack.py` / the original `ledshow.js`) weren't wrong about the working
+byte prefixes — they just had extra harmless zero padding tacked on
+instead of a real checksum, which the device apparently tolerates for
+simple commands. The format above is what the official app actually sends
+and is what this library now generates.
 
-### `setBrightness(value)` — global brightness, 0–255
+## Command reference
 
-Sent on the **`BUFFER`** characteristic (`0xA952`), not `CMD`.
+All commands below are on `CMD` (`0xA951`) unless noted otherwise. Every
+example is a **verified real capture** with a passing CRC unless marked
+otherwise.
+
+### `0x00 0x01` — Set brightness
+
+- **Payload**: `[ VALUE ]` (1 byte, 0–255)
+- **Example** (value=2): `00 01 00 01 02 ad a5`
+- Confirmed via extensive live testing (the app's Brightness slider).
+  *(An independent write-up suggested this opcode is instead a
+  "quick state switch" with values like `0x60`/`0x62`/`0x63` meaning
+  off/demo/on — this looks like a misreading of consecutive slider-drag
+  values, since 0x60–0x63 are just adjacent brightness levels. Rejected in
+  favor of the tested, working behavior.)*
+
+### `0x00 0x02` — Set speed
+
+- **Payload**: `[ VALUE ]` (1 byte, 0–255)
+- **Example** (value=1): `00 02 00 01 01 e8 e5`
+- Confirmed against 100 real samples from a slider drag (sequential
+  values 0x01–0x64, every single CRC matched).
+
+### `0x00 0x04` — Set display effect
+
+- **Payload**: `[ EFFECT ]` (1 byte, 0–7)
+- **Effect values**: `0`=Static, `1`=Left, `2`=Right, `3`=Up, `4`=Down,
+  `5`=Snow, `6`=Scroll, `7`=Laser
+- **Example** (effect=1, Left): `00 04 00 01 01 60 e5`
+- Confirmed via live testing (the app's effect picker). *(Same
+  independent write-up mislabeled this opcode as brightness, reusing this
+  exact byte sequence as "brightness level 1" — rejected for the same
+  reason as above: it's byte-identical to the already-tested, working
+  Left-scroll effect.)* An earlier draft of this doc described the effect
+  as a 3-byte "code" (e.g. `01 60 e5` for Left) — the last 2 of those 3
+  bytes are just this command's CRC, not part of the effect identity.
+
+### `0x01 0x02` — Set active program
+
+Activates a previously-uploaded program/slot (e.g. after a bitmap
+upload finishes).
+
+- **Payload**: `[ ID ]` (1 byte) — only ever observed as `0x01`
+- **Example**: `01 02 00 01 01 28 d8`
+- Packet-level structure confirmed (valid CRC, consistent across two
+  independent captures); only ever seen with `ID=1` so its full range
+  isn't confirmed.
+
+### `0x03 0x01` — Enter Free Draw mode
+
+- **Payload**: `[ 0x01 ]` (fixed)
+- **Example**: `03 01 00 01 01 ac a1`
+- Must be sent once before `0x03 0x02` (draw pixel) commands. Confirmed
+  via extensive live testing (the app's Draw tab).
+
+### `0x03 0x02` — Draw/clear one pixel (Free Draw mode)
+
+- **Payload** (3 bytes): `[ ON_OFF, ROW, (GROUP<<4)|COL_IN_GROUP ]`
+  - `ON_OFF`: `0x00` = light the pixel, `0x04` = clear it
+  - `ROW`: 0–11 (a full byte, top 4 bits unused since the grid is 12 rows)
+  - high nibble = column group (`col / 16`, 0–2 since 48 cols = 3×16),
+    low nibble = column within that group (`col % 16`, 0–15)
+- **Example** (row=5, col=20 → group=1, col-in-group=4, on): payload =
+  `00 05 14` → full packet `03 02 00 03 00 05 14 f9 2a`
+- Confirmed via extensive live testing. A full-frame redraw is 576
+  individual packets (12×48), one per pixel — there's no confirmed bulk
+  version of this command.
+
+### `0x04 0x01` — unconfirmed (only one sample)
+
+- **Payload** (9 bytes), one real capture: `00 60 05 64 64 1e 92 54 3b`
+- **Full example**: `04 01 00 09 00 60 05 64 64 1e 92 54 3b 91 d2`
+- Seen once, immediately before a `BUFFER` bitmap-data write and a
+  `0x01 0x02` (set active program) — i.e. it looks like a "configure
+  upload" step in a bitmap/animation-upload sequence. Field-level meaning
+  is **not** confirmed: an independent write-up proposed
+  `[SLOT, EFFECT_ID, SPEED, PARAM1, PARAM2, HOLD_TIME, ...]`, but applying
+  that breakdown to the *correct* bytes (their transcription had one byte
+  wrong — `06` where the real capture has `60`, confirmed by CRC) gives
+  `EFFECT_ID=0x60`, which is nonsensical for a 0–7 effect selector. With
+  only one sample, this command's fields are open.
+
+### `0x05 0x03` — Play built-in animation
+
+- **Payload** (4 bytes): `[ INDEX, 0x01, 0x64, 0x64 ]`
+- `INDEX`: 0–18 (19 built-in animations)
+- **Example** (index=7): `05 03 00 04 07 01 64 64 6b 39`
+- Confirmed via extensive live testing. The trailing `01 64 64` is a fixed
+  constant across all 19 captured animations, purpose unconfirmed
+  (possibly a fixed style/speed/repeat setting the official app never
+  varies). **Note**: earlier versions of this library stored a 19-entry
+  "hash" lookup table (one seemingly-opaque 2-byte value per animation
+  index) sourced from real captures. Verified against all 19 values: every
+  single one is exactly the CRC-16/MODBUS of `05 03 00 04 <index> 01 64 64`
+  — there was never a lookup table, just this same checksum computed per
+  index. The library now computes it generically instead of storing it.
+
+### `0x06 0x01` — Session start/stop
+
+A general "enter/exit special session" toggle — **not** spectrogram-only.
+Confirmed (via direct testing feedback) to also gate the bitmap-upload
+sequence, so this should be sent before either a spectrogram stream or an
+upload, and the stop variant after.
+
+- **Payload**: `[ 0x01 ]` (start) or `[ 0x00 ]` (stop)
+- **Examples**:
+  - Start: `06 01 00 01 01 ac 6d`
+  - Stop: `06 01 00 01 00 6c ac`
+
+### `0x06 0x02` — Spectrogram frame
+
+- **Payload** (13 bytes): `[ MODE, BAR_0, BAR_1, ..., BAR_11 ]`
+  - `MODE`: `0` = bottom-up bars, `1` = center-symmetric bars — **the
+    device renders this layout itself**; this isn't just a client-side
+    preview choice, the badge honors it natively.
+  - `BAR_0`–`BAR_11`: **12** bar-height bytes (not 10 — an earlier draft
+    of this doc assumed a 10-band layout based on a different family of
+    LED badges; the real payload length here is 13 bytes = 1 mode byte +
+    12 bars, confirmed directly from the declared `LEN` field with no
+    leftover bytes). Each is a full byte, values `0x00`–`0x08` observed
+    (assumed range 0–8, matching the "how many rows lit" semantics; the
+    true max hasn't been independently pushed past 8).
+- **Example** (mode=1/center, all bars=1): `06 02 00 0d 01 01 01 01 01 01
+  01 01 01 01 01 01 01 e7 c4`
+- Must be preceded by `0x06 0x01` (session start).
+
+### `0x01 0x04` on `BUFFER` (`0xA952`) — Bitmap matrix data (unconfirmed encoding)
+
+Part of the same upload sequence as `0x04 0x01` above (config) and
+`0x01 0x02` (activate). The packet envelope is confirmed — opcode, length
+field, and CRC all check out against a real 109-byte capture — but the
+**payload's internal structure is not decoded**:
+
+- Total captured packet: 109 bytes. `LEN` field declares `0x0100` = 256,
+  but only 103 payload bytes are actually present in this single write —
+  same oversized-length pattern seen in the old `Upload Start` captures
+  (see below), suggesting the true content may be intended to span
+  multiple `BUFFER` writes and this is only the first/only chunk of a
+  larger declared size, OR `LEN` here is a fixed allocation-size constant
+  unrelated to actual bytes sent. Not enough samples to tell which.
+- Interpreting the payload as 16-bit big-endian "column" words (the
+  technique that successfully decoded the separate `Upload Start` bitmap
+  below) does **not** produce a clean image here — only ~22 of ~50 words
+  are non-zero, and the leading bytes look more like a repeating
+  header/table (`00 00 60 00 00 00 60 00 ...`) than dense pixel data. This
+  payload may mix a geometry/offset table with sparse pixel data, similar
+  in spirit to the "table of bitmap offsets" approach used by unrelated
+  badge families (see the comparison table further down) — but this is
+  speculation, not a decode.
+- **Not used by this app** — bitmap/text content is still sent through the
+  confirmed, working Free Draw path (`0x03 0x01` + repeated `0x03 0x02`)
+  instead.
+
+## Unconfirmed: custom text/bitmap upload payload semantics
+
+The device has a proprietary way of uploading bitmap content — either
+through the `0x02 0x01` / `0x01 0x04` command pairing (two real captures
+exist) or, per the newer capture, the `0x04 0x01` + `BUFFER 0x01 0x04` +
+`0x01 0x02` sequence documented above. Two things used to block this;
+**one is now solved**:
+
+- **Solved: the checksum.** What looked like an opaque per-upload
+  checksum in `Upload Start` (`0x02 0x01`) is just the same CRC-16/MODBUS
+  used everywhere else in the protocol (see "Command packet format"
+  above). This was the original blocker — it's no longer one. Any new
+  `Upload Start`/config/bitmap packet can now be constructed with a
+  correct, device-accepted CRC.
+- ❌ **Still open: what the payload bytes mean.** Knowing the CRC doesn't
+  tell us what values to put in the payload for new content. Two
+  different upload-family payloads have been examined and neither is
+  fully decoded — see below.
+
+### `0x02 0x01` (`Upload Start`) + bitmap buffer — column encoding partially decoded
 
 ```
-00 01 00 01 VV 6c 24 00 00 00 00 00 00 00 00 00
+02 01 00 0a  <10-byte payload>  <CRC16>
 ```
 
-- `00 01`: opcode = set brightness.
-- `00 01`: param field.
-- `VV`: brightness value, 0–255. **Confirmed** — direct byte value.
-- `6c 24`: constant across captures, purpose unconfirmed.
-- remaining bytes: zero padding.
-
-### `setSpeed(value)` — animation/scroll speed, 0–255
-
-Also on `BUFFER` (`0xA952`).
+Two real captures (now byte-corrected using the confirmed CRC):
 
 ```
-00 02 00 01 VV 28 24 00 00 00 00 00 00 00 00 00
+02 01 00 0a 00 bb 01 64 64 8c 58 3d 32 00 50 a7
+02 01 00 0a 00 77 01 64 64 46 ba be c6 00 15 bb
 ```
 
-Same structure as brightness, with opcode `00 02` and a different constant
-tail (`28 24`).
-
-### `setEffect(effect)` — apply a display effect to currently-loaded content
-
-```
-00 04 00 01 EE EE EE 00 00 00 00 00 00 00 00 00
-```
-
-- `00 04`: opcode = set effect.
-- `00 01`: param field — note this is `1` even though **3 bytes** of effect
-  code follow, which is why byte 2–3's meaning is *not* treated as a
-  reliable general-purpose "byte count" field elsewhere in this doc.
-- `EE EE EE`: a fixed 3-byte code per effect, one of:
-
-  | Effect | Code |
-  |---|---|
-  | Static | `00 a0 24` |
-  | Scroll left | `01 60 e5` |
-  | Scroll right | `02 61 a5` |
-  | Scroll up | `03 a1 64` |
-  | Scroll down | `04 63 25` |
-  | Snow | `05 a3 e4` |
-  | Scroll (generic) | `06 a2 a4` |
-  | Laser | `07 62 65` |
-
-  The leading byte of each code (`00`..`07`) looks like an effect-family
-  index that happens to match the order the official app lists them in;
-  the trailing 2 bytes don't follow an obvious arithmetic pattern and are
-  taken as fixed per-effect constants.
-- remaining bytes: zero padding.
-
-### `spectrogramMode()` — enter Audio Spectrogram mode
+Applying the "1 bit per LED, packed into 16-bit words, MSB-first = top row"
+technique (borrowed from an unrelated badge's reverse-engineering writeup
+— see the comparison table above) to the accompanying bitmap-buffer
+payload from one of these captures produces a clean, clearly-not-random,
+symmetric shape — three repeated blocks that look like the same small
+icon/emoji:
 
 ```
-06 01 00 01 01 ac 6d 00 00 00 00 00 00 00 00 00
+..##..##.............##.............##..##.........
+..##..##.............##.....###.....##..##.........
+..#####.............####.....##......####..........
+.............................##....................
+..........#####..............##....................
+.........##...##.............##....................
+#........##...##.#...........##...#................
+#........#######.#...........##...#................
+.........##..................##....................
+###......##...##...###.......##....................
+.##.......####......##......####...................
+.##.................##.............................
+.##.................##..............####...........
+.#####..............##.............##..##..........
+.##..##.#...........##...#.........##..##.#........
+.##..##.#...........##...#.........##..##.#........
 ```
 
-Same shape as `freeMode()` (opcode family `06` instead of `03`, mode
-selector `01`, then a fixed 2-byte magic `ac 6d` instead of `ac a1`). The
-shared `ac` byte across both modes' magic values, with a differing second
-byte per mode, suggests `ac` may be a fixed "enter mode" marker and the
-second byte a mode-specific id — but this is inferred from only two data
-points and not confirmed.
+That's good evidence for the general column-word technique, but the
+`Upload Start` payload's own field boundaries are still unclear: `01 64
+64` recurs in both captures (possibly a fixed marker, similar to
+`animate()`'s trailing constant), and the 2 bytes before it (`00 bb` /
+`00 77`) look like a length reference but don't obviously match the
+accompanying buffer's actual byte count. Not enough samples to pin down
+precisely.
 
-### `spectrogramFrame(bars[10], side?)` — push one frame of audio-bar data
+### `0x04 0x01` + `BUFFER 0x01 0x04` — different-looking payload, not decoded
 
-```
-06 02 00 0c 01 0S B0 B1 B2 B3 B4 B5 B6 B7 B8 B9
-```
+The newer capture's upload flow uses a differently-shaped bitmap payload
+(see the `0x01 0x04` entry in the command reference above) that does
+**not** decode cleanly with the same column-word technique — it looks more
+like a header/table mixed with sparse data. Whether this is really a
+different content type (e.g. a stored animation slot vs. custom text) or
+a different encoding for the same kind of content isn't known.
 
-- `06 02`: opcode = spectrogram frame.
-- `00 0c`: param field = `0x0c` = 12, matching the 12 payload bytes that
-  follow (`01`, `0S`, and 10 bar bytes) — this is the one command where the
-  param field cleanly matches "byte count of what follows".
-- `01`: constant, purpose unconfirmed.
-- `0S`: low nibble = a "side" value 0–9. The official app varies this per
-  frame; in this library it defaults to a random 0–9 value when not
-  specified. Its exact effect on rendering is unconfirmed — possibly
-  related to which half of the display updates first, or a
-  flicker/dithering seed.
-- `B0`–`B9`: **10 bar-height bytes**, one per frequency bucket, each in the
-  low nibble only (range `0x00`–`0x08`, i.e. 0–8). **Confirmed** — this is
-  the field this app maps its FFT data into. How the device physically
-  lays these 10 values out on the 12×48 grid (spacing, bottom-up vs.
-  center-out growth) varies by unit/firmware and is **not part of the wire
-  protocol** — it's entirely up to the device's own rendering, which is why
-  this app's on-screen preview offers multiple visual styles to match
-  different observed behavior rather than asserting one true layout.
+### What would unblock this
 
-## Unconfirmed: custom text upload
+More real captures, ideally systematic ones: the same short upload
+repeated identically (sanity check — same input should give byte-identical
+output), then single-character changes one at a time, for **both** upload
+families above. With the CRC no longer in the way, any hypothesis can now
+be tested by constructing a real packet and sending it to the device to
+see what renders — trial and error against real hardware is viable now in
+a way it wasn't before.
 
-The official app can upload a proprietary bitmap/font blob so that text
-scrolls natively on-device (rather than this app's client-side
-render-and-push-through-Free-Draw workaround). Two full captures of this
-sequence exist, each following the same 3-step shape:
+Until this is resolved, this app does not use either native upload path;
+text and drawings are sent through the confirmed, working Free Draw path
+instead (see the README's "Known limitations" section).
 
-1. **Upload Start** (on `CMD`, `0xA951`):
-   ```
-   02 01 00 0a <LEN(2 bytes)> <8 bytes, purpose unconfirmed — checksum/id?>
-   ```
-   Example capture:
-   ```
-   02 01 00 0a 00 bb 01 64 64 8c 58 3d 32 00 50 a7
-   ```
-2. **Bitmap buffer** (on `BUFFER`, `0xA952`): a long variable-length
-   payload starting `01 02 01 00 00 <LEN(2 bytes)> 00 00 <LEN(2 bytes)>`
-   followed by a stream of 4-hex-digit big-endian-looking words, then
-   trailing zero padding. Believed to encode the glyph bitmap column by
-   column, but the exact bit-packing (which bits map to which of the 12
-   rows, how column width/kerning is encoded, whether it's per-glyph or a
-   single packed string) has **not** been decoded.
-3. **Select** (on `CMD`, `0xA951`):
-   ```
-   01 02 00 01 01 28 d8 00 00 00 00 00 00 00 00 00
-   ```
-   Identical in both captures — likely just "commit/display the just-loaded
-   content", constant regardless of what was uploaded.
-
-Because only two real-world samples exist (both short strings), there
-isn't enough data to reliably reverse the bitmap encoding — a real decode
-would need several more captures of different, ideally single-character
-and progressively longer strings, to isolate how length and per-glyph data
-vary. Until then, this app does not use this upload path at all; see the
-README's "Known limitations" section.
 
 ## Confirmed working values quick-reference
 
 | Constant | Value |
 |---|---|
 | Grid size | 12 rows × 48 columns |
+| Packet envelope | `CMD_GRP(1) + CMD_ID(1) + LEN(2, big-endian) + PAYLOAD(LEN) + CRC16(2, big-endian)` |
+| CRC algorithm | CRC-16/MODBUS (poly `0x8005` reflected, init `0xFFFF`, no xorout) |
 | Animation indices | 0–18 (19 total) |
+| Effect indices | 0–7 (Static, Left, Right, Up, Down, Snow, Scroll, Laser) |
 | Brightness range | 0–255 |
 | Speed range | 0–255 |
-| Spectrogram bars per frame | 10, each 0–8 |
+| Spectrogram bars per frame | **12**, each 0–8, plus 1 mode byte (0=bottom, 1=center) |

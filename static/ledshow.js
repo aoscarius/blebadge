@@ -6,12 +6,24 @@
  * UI — drawing, text rendering, tab switching, etc. all live in the app
  * that uses this file.
  *
- * To add a newly reverse-engineered command, don't touch the connection
- * or write-queue internals — just add a one-line wrapper that calls
- * this.send(hex) or this.sendBuf(hex), e.g.:
+ * PACKET FORMAT (confirmed from a real BLE HCI snoop capture, see PROTOCOL.md):
+ *
+ *   [group: 2 bytes] [id: 2 bytes] [len: 2 bytes, big-endian] [payload: len bytes] [CRC16/MODBUS: 2 bytes, big-endian]
+ *
+ * There is no fixed packet size and no zero-padding — every packet is
+ * exactly 6 + len bytes, and the last 2 bytes are a CRC-16/MODBUS checksum
+ * (poly 0x8005 reflected / 0xA001, init 0xFFFF) computed over everything
+ * before it. This one packet builder (`_packet`) replaces what used to be
+ * a set of hand-captured hex strings padded to 16 bytes — including the
+ * old per-animation "hash" table, which turned out to just be this same
+ * CRC computed over each animation's command bytes, not real lookup data.
+ *
+ * To add a newly reverse-engineered command, don't touch the connection,
+ * queueing, or CRC internals — just add a one-line wrapper that calls
+ * this.send(cmdGrp, cmdId, payloadBytes), e.g.:
  *
  *   async someNewFeature(v) {
- *     await this.send(`AABBCCDD${v.toString(16).padStart(2,'0')}...`);
+ *     await this.send(0xAA, 0xBB, [v]);
  *   }
  *
  * Loaded as a plain classic script (no ES module syntax) so it works
@@ -20,8 +32,12 @@
  */
 class LedShow {
   static ROWS = 12; static COLS = 48;
-  static ANIM_HASHES = ["1f38","e339","a739","5b38","2f39","d338","9738","6b39","7f3a","833b","c73b","3b3a","4f3b","b33a","f73a","0b3b","df3c","233d","673d"];
-  static EFFECT = { STATIC:"00a024", LEFT:"0160e5", RIGHT:"0261a5", UP:"03a164", DOWN:"046325", SNOW:"05a3e4", SCROLL:"06a2a4", LASER:"076265" };
+
+  // Confirmed single-byte effect selector (previously mis-documented as a
+  // 3-byte "code" — the other 2 bytes were always just the CRC of that
+  // specific command, not part of the effect identity).
+  static EFFECT = { STATIC: 0, LEFT: 1, RIGHT: 2, UP: 3, DOWN: 4, SNOW: 5, SCROLL: 6, LASER: 7 };
+
   static UUID = {
     SERVICE:  LedShow._uuid(0xA950),
     SERVICE2: LedShow._uuid(0xAE00), // device splits characteristics across two services
@@ -42,11 +58,32 @@ class LedShow {
   get connected() { return !!(this._device?.gatt.connected); }
 
   static _uuid(id) { return `0000${id.toString(16).padStart(4,'0')}-0000-1000-8000-00805f9b34fb`; }
-  static _rnd5() { return Math.floor(Math.random()*16**5).toString(16).padStart(5,'0'); }
   static _sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
-  static _hex(hex) { return new Uint8Array(hex.match(/.{2}/g).map(b=>parseInt(b,16))); }
   static _range(v,a,b,n) { if (v<a||v>b) throw new RangeError(`${n} must be ${a}-${b}, got ${v}`); }
   _assertCmd() { if (!this._charCmd) throw new Error('Not connected'); }
+
+  // CRC-16/MODBUS: poly 0x8005 reflected (0xA001), init 0xFFFF, no xorout.
+  // Confirmed byte-for-byte against a real capture across every command
+  // type this library sends (see PROTOCOL.md).
+  static _crc16modbus(bytes) {
+    let crc = 0xFFFF;
+    for (const b of bytes) {
+      crc ^= b;
+      for (let i = 0; i < 8; i++) {
+        crc = (crc & 1) ? ((crc >>> 1) ^ 0xA001) : (crc >>> 1);
+      }
+    }
+    return crc & 0xFFFF;
+  }
+
+  // Builds a full packet: opcode(2) + len(2, big-endian) + payload + crc(2, big-endian).
+  static _packet(cmdGrp, cmdId, payloadBytes) {
+    const payload = Array.from(payloadBytes);
+    const body = [cmdGrp, cmdId, (payload.length >> 8) & 0xff, payload.length & 0xff, ...payload];
+    const crc = LedShow._crc16modbus(body);
+    body.push((crc >> 8) & 0xff, crc & 0xff);
+    return new Uint8Array(body);
+  }
 
   async connect(onDisconnect) {
     if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported in this browser');
@@ -86,21 +123,31 @@ class LedShow {
     this._charCmd = this._charBuf = this._charName = null; this._device = null;
   }
 
-  // ── Generic raw command — this is the one thing to reuse when you
-  // reverse-engineer a new command from a BLE sniff. Just add a one-line
-  // wrapper below, e.g.:
-  //   async someNewFeature(v) { await this.send(`AABBCCDD${v.toString(16).padStart(2,'0')}...`); }
-  async send(hex)    { this._assertCmd(); return this._enqueue(() => this._charCmd.writeValueWithoutResponse(LedShow._hex(hex))); }
-  async sendBuf(hex)  { if (!this._charBuf) throw new Error('Buffer characteristic (0xA952) unavailable'); return this._enqueue(() => this._charBuf.writeValueWithoutResponse(LedShow._hex(hex))); }
+  // ── Generic command builders — reuse these for anything newly
+  // reverse-engineered. Both compute the CRC automatically.
+  //   await led.send(0xAA, 0xBB, [1, 2, 3]);      // writes to CMD (0xA951)
+  //   await led.sendBuf(0xAA, 0xBB, [1, 2, 3]);   // writes to BUFFER (0xA952)
+  async send(cmdGrp, cmdId, payloadBytes = []) {
+    this._assertCmd();
+    const packet = LedShow._packet(cmdGrp, cmdId, payloadBytes);
+    console.log("send:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
+    return this._enqueue(() => this._charCmd.writeValueWithoutResponse(packet));
+  }
+  async sendBuf(cmdGrp, cmdId, payloadBytes = []) {
+    if (!this._charBuf) throw new Error('Buffer characteristic (0xA952) unavailable');
+    const packet = LedShow._packet(cmdGrp, cmdId, payloadBytes);
+    console.log("sendBuf:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
+    return this._enqueue(() => this._charBuf.writeValueWithoutResponse(packet));
+  } 
 
-  async freeMode() { await this.send('0301000101aca1000000000000000000'); }
+  async freeMode() { await this.send(0x03, 0x01, [0x01]); }
 
   async drawPixel(row, col, on = true) {
     LedShow._range(row, 0, 11, 'row'); LedShow._range(col, 0, 47, 'col');
-    const m = on ? '00' : '04';
-    const q = Math.floor(col/16) % 3;
+    const m = on ? 0x00 : 0x04;
+    const q = Math.floor(col / 16) % 3;
     const cy = col % 16;
-    await this.send(`03020003${m}0${row.toString(16)}${q.toString(16)}${cy.toString(16).padStart(1,'0')}${LedShow._rnd5()}0000000000000`);
+    await this.send(0x03, 0x02, [m, row, (q << 4) | cy]);
   }
 
   async drawFrame(frame) {
@@ -109,19 +156,42 @@ class LedShow {
         await this.drawPixel(r, c, !!(frame[r]?.[c]));
   }
 
-  async animate(index) {
-    LedShow._range(index, 0, 18, 'animation index');
-    await this.send(`05030004${index.toString(16).padStart(2,'0')}016464${LedShow.ANIM_HASHES[index]}000000000000`);
+  async clearFrame() {
+    await this.send(0x03, 0x01, [0x01]);
   }
 
-  async setBrightness(v) { LedShow._range(v,0,255,'brightness'); await this.sendBuf(`00010001${v.toString(16).padStart(2,'0')}6c24000000000000000000`); }
-  async setSpeed(v)      { LedShow._range(v,0,255,'speed');      await this.sendBuf(`00020001${v.toString(16).padStart(2,'0')}2824000000000000000000`); }
-  async setEffect(effect) { await this.send(`00040001${effect}000000000000000000`); }
+  async animate(index) {
+    LedShow._range(index, 0, 18, 'animation index');
+    await this.send(0x05, 0x03, [index, 0x00, 0x00, 0x64]);
+  }
 
-  async spectrogramMode() { await this.send('06010001' + '01' + 'ac6d' + '000000000000000000'); }
-  async spectrogramFrame(bars, side) {
-    if (!Array.isArray(bars) || bars.length !== 10) throw new TypeError('bars must have exactly 10 values (0-8)');
-    const s = (side !== undefined ? side : Math.floor(Math.random()*10)).toString(16).padStart(2,'0');
-    await this.send('0602000c' + '01' + '0' + s.slice(-1) + bars.map(v => `0${v.toString(16)}`).join(''));
+  async setBrightness(v) { LedShow._range(v, 0, 255, 'brightness'); await this.send(0x00, 0x01, [v]); }
+  async setSpeed(v)      { LedShow._range(v, 0, 255, 'speed');      await this.send(0x00, 0x02, [v]); }
+  async setEffect(effect) { LedShow._range(effect, 0, 7, 'effect'); await this.send(0x00, 0x04, [effect]); }
+
+  // Activates a previously-uploaded program/slot (e.g. after a bitmap
+  // upload). Only ever observed with id=1 in captures.
+  async setActiveProgram(id = 1) { await this.send(0x01, 0x02, [id]); }
+
+  // Confirmed (opcode 0x06 0x01, payload = single 0x01/0x00 byte): a
+  // general "enter/exit special session" toggle, shared by BOTH the
+  // spectrogram stream AND the bitmap-upload flow — not spectrogram-only,
+  // despite the earlier name. Call sessionStart() before streaming
+  // spectrogram frames or before an upload sequence, sessionStop() after.
+  async sessionStart() { await this.send(0x06, 0x01, [0x01]); }
+  async sessionStop()  { await this.send(0x06, 0x01, [0x00]); }
+  // Kept as an alias — spectrogram mode entry is just a session start.
+  async spectrogramMode() { await this.sessionStart(); }
+
+  // Confirmed: payload = [MODE, 12 bar-height bytes]. MODE 0 = bottom-up
+  // bars, 1 = center-symmetric bars — the device renders this layout
+  // itself; pass whichever the UI has selected so the physical badge
+  // matches the on-screen preview. Bar values 0-8 (matches the display's
+  // usable row range); the true max hasn't been independently confirmed
+  // beyond that assumption.
+  async spectrogramFrame(bars, mode = 0) {
+    if (!Array.isArray(bars) || bars.length !== 12) throw new TypeError('bars must have exactly 12 values (0-8)');
+    LedShow._range(mode, 0, 1, 'mode');
+    await this.send(0x06, 0x02, [mode, ...bars]);
   }
 }
