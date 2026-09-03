@@ -47,7 +47,7 @@ class LedShow {
     NOTIFY:   LedShow._uuid(0xA953),
   };
 
-  constructor() { this._device = null; this._charCmd = null; this._charBuf = null; this._charName = null; this._writeQueue = Promise.resolve(); }
+  constructor() { this._device = null; this._charCmd = null; this._charBuf = null; this._charName = null; this._charNotify = null; this._lastNotify = null; this._notifyWaiter = null; this._writeQueue = Promise.resolve(); }
 
   // Serializes all BLE writes so rapid calls (e.g. live drawing) never overlap.
   _enqueue(taskFn) {
@@ -76,6 +76,17 @@ class LedShow {
     return crc & 0xFFFF;
   }
 
+  static _crc32c(data) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) {
+        crc ^= data[i];
+        for (let j = 0; j < 8; j++) {
+            crc = (crc >>> 1) ^ ((crc & 1) ? 0x82F63B78 : 0);
+        }
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  
   // Builds a full packet: opcode(2) + len(2, big-endian) + payload + crc(2, big-endian).
   static _packet(cmdGrp, cmdId, payloadBytes) {
     const payload = Array.from(payloadBytes);
@@ -111,16 +122,44 @@ class LedShow {
     this._charCmd  = find(LedShow.UUID.CMD);
     this._charBuf  = find(LedShow.UUID.BUFFER);
     this._charName = find(LedShow.UUID.NAME);
+    this._charNotify = find(LedShow.UUID.NOTIFY);
     if (!this._charCmd) throw new Error('Command characteristic (0xA951) not found on this device — check the service UUIDs match what your scanner reported');
     if (onDisconnect) this._device.addEventListener('gattserverdisconnected', onDisconnect);
+
+    // Listen for device ACK/status notifications (0xA953). Confirmed real
+    // example: after an Upload Start command, the device replies with the
+    // same opcode echoed back plus a 1-byte status (0x01 = OK, 0x03 = seen
+    // once on what looked like a rejected/aborted upload). Not otherwise
+    // documented, but useful for surfacing real errors instead of guessing.
+    if (this._charNotify) {
+      try {
+        await this._charNotify.startNotifications();
+        this._charNotify.addEventListener('characteristicvaluechanged', (e) => {
+          const bytes = new Uint8Array(e.target.value.buffer);
+          this._lastNotify = bytes;
+          if (this._notifyWaiter) { this._notifyWaiter(bytes); this._notifyWaiter = null; }
+        });
+      } catch {}
+    }
+
     let name = this._device.name;
     if (this._charName) { try { name = new TextDecoder().decode(await this._charName.readValue()); } catch {} }
     return name || 'LedShow';
   }
 
+  // Resolves with the next NOTIFY payload (raw bytes), or null on timeout.
+  // Only one waiter at a time — fine for this library's sequential upload
+  // flow, which never has two outstanding requests at once.
+  _waitForNotify(timeoutMs = 1500) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { this._notifyWaiter = null; resolve(null); }, timeoutMs);
+      this._notifyWaiter = (bytes) => { clearTimeout(timer); resolve(bytes); };
+    });
+  }
+
   async disconnect() {
     if (this._device?.gatt.connected) this._device.gatt.disconnect();
-    this._charCmd = this._charBuf = this._charName = null; this._device = null;
+    this._charCmd = this._charBuf = this._charName = this._charNotify = null; this._device = null;
   }
 
   // ── Generic command builders — reuse these for anything newly
@@ -130,13 +169,13 @@ class LedShow {
   async send(cmdGrp, cmdId, payloadBytes = []) {
     this._assertCmd();
     const packet = LedShow._packet(cmdGrp, cmdId, payloadBytes);
-    console.log("send:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
+    // console.log("send:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
     return this._enqueue(() => this._charCmd.writeValueWithoutResponse(packet));
   }
   async sendBuf(cmdGrp, cmdId, payloadBytes = []) {
     if (!this._charBuf) throw new Error('Buffer characteristic (0xA952) unavailable');
     const packet = LedShow._packet(cmdGrp, cmdId, payloadBytes);
-    console.log("sendBuf:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
+    // console.log("sendBuf:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
     return this._enqueue(() => this._charBuf.writeValueWithoutResponse(packet));
   } 
 
@@ -165,8 +204,8 @@ class LedShow {
     await this.send(0x05, 0x03, [index, 0x00, 0x00, 0x64]);
   }
 
-  async setBrightness(v) { LedShow._range(v, 0, 255, 'brightness'); await this.send(0x00, 0x01, [v]); }
-  async setSpeed(v)      { LedShow._range(v, 0, 255, 'speed');      await this.send(0x00, 0x02, [v]); }
+  async setBrightness(v) { LedShow._range(v, 0, 100, 'brightness'); await this.send(0x00, 0x01, [v]); }
+  async setSpeed(v)      { LedShow._range(v, 0, 100, 'speed');      await this.send(0x00, 0x02, [v]); }
   async setEffect(effect) { LedShow._range(effect, 0, 7, 'effect'); await this.send(0x00, 0x04, [effect]); }
 
   // Activates a previously-uploaded program/slot (e.g. after a bitmap
@@ -193,5 +232,115 @@ class LedShow {
     if (!Array.isArray(bars) || bars.length !== 12) throw new TypeError('bars must have exactly 12 values (0-8)');
     LedShow._range(mode, 0, 1, 'mode');
     await this.send(0x06, 0x02, [mode, ...bars]);
+  }
+
+  // ── Native bitmap upload ──────────────────────────────
+  // Confirmed from 5 real captures now — including one COMPLETE sequence
+  // with the device's own ACK notifications at every step, sniffed while
+  // the official app successfully performed an upload — that the BUFFER
+  // (0xA952) bitmap chunk uses a DIFFERENT, larger header than the
+  // generic command envelope:
+  //
+  //   01 02 01 00  00 <LEN:2 BE>  00 00  <LEN:2 BE>  <LEN bytes payload>  <CRC16>
+  //
+  // The payload itself is confirmed: one 16-bit big-endian word per
+  // column, bit 15 = top row. All 16 bits carry real content in every
+  // real capture examined — NOT just the physical display's 12 rows —
+  // so the true canvas height for this format is 16, not 12. How those
+  // 16 rows map onto the 12-row physical display (crop position, likely
+  // vertically centered) is NOT confirmed. This method assumes centered
+  // cropping (2 blank rows top and bottom) as the most likely default.
+  //
+  // The complete real sequence (see protocol.md) is: Upload Start -> wait
+  // for ACK -> Buffer bitmap write -> wait for ACK -> Set Active Program
+  // -> wait for ACK. Notably, it does NOT involve Session Start/Stop
+  // (0x06 0x01) at all, despite an earlier version of this file assuming
+  // it did.
+  static _bufferBitmapPacket(slot, payloadBytes) {
+    const payload = Array.from(payloadBytes);
+    const lenHi = (payload.length >> 8) & 0xff, lenLo = payload.length & 0xff;
+    const body = [
+      0x01, 0x02,
+      slot & 0xff,               // Frame sequence index
+      0x00, 0x00, lenHi, lenLo,  // Length 16-bit (Big-Endian)
+      0x00, 0x00, lenHi, lenLo,
+      ...payload
+    ];
+    const crc = LedShow._crc16modbus(body);
+    body.push((crc >> 8) & 0xff, crc & 0xff);
+    return new Uint8Array(body);
+  }
+
+  async _sendBufferBitmap(slot, payloadBytes) {
+    if (!this._charBuf) throw new Error('Buffer characteristic (0xA952) unavailable');
+    const packet = LedShow._bufferBitmapPacket(slot, payloadBytes);
+    // console.log("sendBuf:", "(", packet.length, ")", Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join('').toLowerCase());
+    return this._enqueue(() => this._charBuf.writeValueWithoutResponse(packet));
+  }
+
+  // Encodes a 12-row-tall boolean matrix (rows x cols) into the confirmed
+  // column-word byte format: one 16-bit big-endian word per column.
+  static encodeBitmap12(matrix12xN, mode = 3) {
+    const cols = matrix12xN[0]?.length || 0;
+    const modes = {0x03: 8 , 0x04: 12};
+    const bytes = [];
+    let colsCounter = 0;
+
+    // Every block starts with selected mode
+    bytes.push(mode & 0x0F);
+    for (let c = 0; c < cols; c++) {
+      let word = 0;
+      for (let r = 0; r < 12; r++) {
+        if (matrix12xN[r]?.[c]) {
+          word |= (1 << (11 - r));
+        }
+      }
+      const word16 = (word << 4) & 0xffff;
+      bytes.push((word16 >> 8) & 0xff, word16 & 0xff);
+
+      // Add marker after selected trasmitted columns
+      colsCounter += 1; if (colsCounter % modes[mode] === 0) 
+        bytes.push(mode & 0x0F);
+    }
+
+    return bytes;
+  }
+
+  async uploadBitmap(matrix12xN, slot = 1, effect = LedShow.EFFECT.STATIC, speed = 0x64, brightness = 0x64) {
+    // const payload = LedShow.hexToBytes("");
+    const payload = LedShow.encodeBitmap12(matrix12xN);
+    const lenHi = (payload.length >> 8) & 0xff, lenLo = payload.length & 0xff;
+    const pcrc32 = LedShow._crc32c(Array.from(payload));
+    const bcrc = [
+      (pcrc32 >> 24) & 0xff,
+      (pcrc32 >> 16) & 0xff,
+      (pcrc32 >> 8)  & 0xff,
+       pcrc32        & 0xff
+    ];
+
+    LedShow._range(effect, LedShow.EFFECT.STATIC, LedShow.EFFECT.LASER, 'effect');
+    LedShow._range(speed, 0, 100, 'speed');
+    LedShow._range(brightness, 0, 100, 'brightness');
+
+    await this.send(0x02, 0x01, [
+      lenHi, lenLo,
+      effect,
+      speed,
+      brightness,
+      ...bcrc,
+      0x00
+    ]);
+    const startAck = await this._waitForNotify();
+    let bitmapAcked = false;
+    if (startAck && startAck[0] === 0x02 && startAck[1] === 0x01 && startAck.length >= 5) {
+      bitmapAcked = true;
+    }
+
+    await this._sendBufferBitmap(slot, payload);
+    await this.setActiveProgram(slot);
+
+    return {
+      bitmapAcked, // true = device explicitly confirmed Upload Start (status 0x01)
+    };
   }
 }

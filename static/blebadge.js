@@ -89,7 +89,7 @@ btnConn.addEventListener('click', async () => {
 // Tabs
 // ═══════════════════════════════════════════════════════════
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
+  btn.addEventListener('click', async () => {
     const tab = btn.dataset.tab;
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -97,7 +97,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById('panel-' + tab).classList.add('active');
     document.getElementById('preview-area').classList.toggle('hidden', tab === 'anim');
     if (tab === 'anim') renderAnimPreviews();
-    if (tab === 'draw') syncDrawCanvas();
+    if (tab === 'draw') { syncDrawCanvas(); await led.uploadBitmap(drawPixels, 1); }
   });
 });
 
@@ -116,7 +116,7 @@ function buildEffectPills(containerId, defaultKey) {
     const d = document.createElement('div');
     d.className = 'pill' + (e.key === defaultKey ? ' active' : '');
     d.textContent = e.label; d.dataset.effect = e.key;
-    d.addEventListener('click', () => { row.querySelectorAll('.pill').forEach(p => p.classList.remove('active')); d.classList.add('active'); });
+    d.addEventListener('click', () => { row.querySelectorAll('.pill').forEach(p => p.classList.remove('active')); d.classList.add('active'); led.setEffect(getSelectedEffect(containerId)); });
     row.appendChild(d);
   });
 }
@@ -128,15 +128,18 @@ function getSelectedEffect(rowId) {
 }
 
 // Sliders
-function bindSlider(id, lblId, suffix = '') {
+function bindSlider(id, lblId, suffix = '', fn = null) {
   const sl = document.getElementById(id), lb = document.getElementById(lblId);
   sl.addEventListener('input', () => lb.textContent = sl.value + suffix);
+  if (fn != null) 
+    sl.addEventListener('change', async() => { try {await fn(parseInt(sl.value))} catch {}} );
 }
-bindSlider('sl-text-bright','lbl-text-bright');
-bindSlider('sl-text-speed','lbl-text-speed');
-bindSlider('sl-draw-bright','lbl-draw-bright');
-bindSlider('sl-anim-bright','lbl-anim-bright');
-bindSlider('sl-music-gain','lbl-music-gain');
+bindSlider('sl-text-bright','lbl-text-bright', '%', (val) => led.setBrightness(val));
+bindSlider('sl-text-speed','lbl-text-speed', '%', (val) => led.setSpeed(val));
+bindSlider('sl-draw-bright','lbl-draw-bright', '%', (val) => led.setBrightness(val));
+bindSlider('sl-draw-speed','lbl-draw-speed', '%', (val) => led.setSpeed(val));
+bindSlider('sl-anim-bright','lbl-anim-bright', '%', (val) => led.setBrightness(val));
+bindSlider('sl-music-gain','lbl-music-gain', 'x');
 
 // ═══════════════════════════════════════════════════════════
 // TEXT TAB — render text to a bitmap
@@ -149,7 +152,8 @@ function renderTextToWideMatrix(text) {
   const h = 12 * scale;
   const measureCanvas = document.createElement('canvas');
   const mctx = measureCanvas.getContext('2d');
-  mctx.font = `bold ${Math.floor(h*1.0)}px Courier, "Courier New", monospace`;
+  mctx.font = `bold ${Math.floor(h * 1.1)}px "Trebuchet MS", sans-serif`;
+  mctx.imageSmoothingEnabled = false;
   const textW = Math.max(mctx.measureText(text || ' ').width + h, 48*scale);
   const w = Math.ceil(textW);
 
@@ -158,16 +162,19 @@ function renderTextToWideMatrix(text) {
   const ctx = off.getContext('2d');
   ctx.fillStyle = '#000'; ctx.fillRect(0,0,w,h);
   ctx.fillStyle = '#fff';
-  ctx.font = `bold ${Math.floor(h*1.0)}px Courier, "Courier New", monospace`;
+  ctx.font = `bold ${Math.floor(h * 1.1)}px "Trebuchet MS", sans-serif`;
+  ctx.imageSmoothingEnabled = false;
   ctx.textBaseline = 'middle';
-  ctx.fillText(text || ' ', h*0.2, h/2);
+  ctx.fillText(text || ' ', h*0.1, h/1.8);
   const img = ctx.getImageData(0,0,w,h);
   const cols = Math.round(w/scale);
   const frame = new Array(12).fill(null).map(() => new Uint8Array(cols));
-  for (let r=0;r<12;r++) for (let c=0;c<cols;c++) {
-    const pr = Math.min(h-1, r*scale + Math.floor(scale/2));
-    const pc = Math.min(w-1, c*scale + Math.floor(scale/2));
-    frame[r][c] = img.data[(pr*w+pc)*4] > 90 ? 1 : 0;
+  for (let r=0;r<12;r++) {
+    for (let c=0;c<cols;c++) {
+      const pr = Math.min(h-1, r*scale + Math.floor(scale/2));
+      const pc = Math.min(w-1, c*scale + Math.floor(scale/2));
+      frame[r][c] = img.data[(pr*w+pc)*4] > 90 ? 1 : 0;
+    }
   }
   return frame; // frame[row] has `cols` columns (cols >= 48)
 }
@@ -175,9 +182,11 @@ function renderTextToWideMatrix(text) {
 function windowFrame(wideFrame, offset) {
   const cols = wideFrame[0].length;
   const frame = new Array(12).fill(null).map(() => new Uint8Array(48));
-  for (let r=0;r<12;r++) for (let c=0;c<48;c++) {
-    const src = (offset + c) % cols;
-    frame[r][c] = wideFrame[r][src];
+  for (let r=0;r<12;r++) {
+    for (let c=0;c<48;c++) {
+      const src = (offset + c) % cols;
+      frame[r][c] = wideFrame[r][src];
+    }
   }
   return frame;
 }
@@ -195,20 +204,20 @@ document.getElementById('btn-send-text').addEventListener('click', async () => {
   const speed  = parseInt(document.getElementById('sl-text-speed').value);
   const effect = getSelectedEffect('text-effect-row');
 
-  try {
-    await led.setBrightness(bright);
-    await led.setSpeed(speed);
-    await led.freeMode();
-
-    toast('Sending…');
-    const wide = renderTextToWideMatrix(text);
-    const frame = windowFrame(wide, 0);
-    setPixels(frame);
-    await led.drawFrame(frame);
-    await led.setEffect(effect);
-    toast('Sent ✓');
-
-  } catch (e) { toast('Send error: ' + e.message); console.error(e); }
+    try {
+      await led.setBrightness(bright);
+      const matrix12 = renderTextToWideMatrix(text);
+      const result = await led.uploadBitmap(matrix12, 1, effect, speed, bright);
+      if (result.bitmapAcked) {
+        toast('Device confirmed the upload — check the badge. Report back either way!', 4500);
+      } else {
+        toast('Upload sent, but no confirmation from the device — check the badge and report what you see.', 4500);
+      }
+      // console.log('Upload ACK detail:', result);
+    } catch (e) {
+      toast('Upload failed: ' + e.message, 4000);
+      console.error('Upload error (this detail is useful to report):', e);
+    }
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -223,7 +232,8 @@ let drawTool = 'draw';
 function syncDrawCanvas() {
   dCtx.fillStyle = '#000'; dCtx.fillRect(0,0,48,12);
   for (let r=0;r<12;r++) for (let c=0;c<48;c++) {
-    dCtx.fillStyle = drawPixels[r][c] ? '#FF3333' : '#1A1A1A';
+    drawPixels[r][c] = pixels[r][c];
+    dCtx.fillStyle = pixels[r][c] ? '#FF3333' : '#1A1A1A';
     dCtx.fillRect(c,r,1,1);
   }
 }
@@ -280,8 +290,7 @@ document.getElementById('tool-erase').addEventListener('click', () => {
 });
 document.getElementById('tool-clear').addEventListener('click', () => {
   for (let r=0;r<12;r++) drawPixels[r].fill(0);
-  syncDrawCanvas(); clearPixels();
-  led.clearFrame();
+  clearPixels(); syncDrawCanvas(); led.clearFrame();
 });
 document.getElementById('tool-invert').addEventListener('click', () => {
   for (let r=0;r<12;r++) for (let c=0;c<48;c++) { drawPixels[r][c] ^= 1; pixels[r][c] = drawPixels[r][c]; }
@@ -303,7 +312,7 @@ document.getElementById('tool-save').addEventListener('click', () => {
 document.getElementById('load-png').addEventListener('change', function(){
   const file = this.files[0]; if (!file) return;
   const img = new Image();
-  img.onload = () => {
+  img.onload = async () => {
     const off = document.createElement('canvas'); off.width = 48; off.height = 12;
     const octx = off.getContext('2d');
     octx.fillStyle = '#000'; octx.fillRect(0,0,48,12);
@@ -314,7 +323,21 @@ document.getElementById('load-png').addEventListener('change', function(){
       drawPixels[r][c] = v; pixels[r][c] = v;
     }
     syncDrawCanvas(); renderPreview(); toast('Image loaded ✓');
-    pushFullFrameIfLive();
+    const bright = parseInt(document.getElementById('sl-draw-bright').value);
+    const speed  = parseInt(document.getElementById('sl-draw-speed').value);
+    const effect = getSelectedEffect('draw-effect-row');
+    try {
+      const result = await led.uploadBitmap(drawPixels, 1, effect, speed, bright);
+      if (result.bitmapAcked) {
+        toast('Device confirmed the upload — check the badge. Report back either way!', 4500);
+      } else {
+        toast('Upload sent, but no confirmation from the device — check the badge and report what you see.', 4500);
+      }
+      // console.log('Upload ACK detail:', result);
+    } catch (e) {
+      toast('Upload failed: ' + e.message, 4000);
+      console.error('Upload error (this detail is useful to report):', e);
+    }    
   };
   img.src = URL.createObjectURL(file);
   this.value = '';
@@ -322,15 +345,20 @@ document.getElementById('load-png').addEventListener('change', function(){
 
 document.getElementById('btn-send-draw').addEventListener('click', async () => {
   const bright = parseInt(document.getElementById('sl-draw-bright').value);
+  const speed  = parseInt(document.getElementById('sl-draw-speed').value);
   const effect = getSelectedEffect('draw-effect-row');
   try {
-    toast('Sending…');
-    await led.freeMode();
-    await led.setBrightness(bright);
-    await led.drawFrame(drawPixels);
-    await led.setEffect(effect);
-    toast('Sent ✓');
-  } catch (e) { toast('Send error: ' + e.message); console.error(e); }
+    const result = await led.uploadBitmap(drawPixels, 1, effect, speed, bright);
+    if (result.bitmapAcked) {
+      toast('Device confirmed the upload — check the badge. Report back either way!', 4500);
+    } else {
+      toast('Upload sent, but no confirmation from the device — check the badge and report what you see.', 4500);
+    }
+    console.log('Upload ACK detail:', result);
+  } catch (e) {
+    toast('Upload failed: ' + e.message, 4000);
+    console.error('Upload error (this detail is useful to report):', e);
+  }
 });
 
 // ═══════════════════════════════════════════════════════════

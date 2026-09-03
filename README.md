@@ -7,7 +7,7 @@ no app install, no native code.
 
 Everything here is the result of reverse-engineering the badge's Bluetooth
 protocol by sniffing traffic from the official app. See
-[`protocol.md`](./protocol.md) for the full protocol writeup, and the
+[`PROTOCOL.md`](./PROTOCOL.md) for the full protocol writeup, and the
 "Known limitations" section below for what's still unconfirmed.
 
 ## Requirements
@@ -21,18 +21,18 @@ protocol by sniffing traffic from the official app. See
   # or
   python3 -m http.server 8000
   ```
-  then open `http://localhost:<port>/ledshow-controller.html`.
+  then open `http://localhost:<port>/index.html`.
 - A LedShow badge, powered on and in range.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `ledshow-controller.html` | Markup only — the app's structure/tabs. Loads `style.css` and the two scripts below. |
+| `index.html` | Markup only — the app's structure/tabs. Loads `style.css` and the two scripts below. |
 | `style.css` | All styling. |
-| `app.js` | App logic: canvas drawing, text rendering, audio FFT, tab switching, animation previews — everything that talks to the DOM. Calls into `ledshow.js` for anything device-related. |
+| `blebadge.js` | App logic: canvas drawing, text rendering, audio FFT, tab switching, animation previews — everything that talks to the DOM. Calls into `ledshow.js` for anything device-related. |
 | `ledshow.js` | Standalone BLE protocol library (`class LedShow`). No UI/DOM code at all — just device communication. |
-| `protocol.md` | Full writeup of the BLE GATT protocol, byte-level command layouts, and open questions. |
+| `PROTOCOL.md` | Full writeup of the BLE GATT protocol, byte-level command layouts, and open questions. |
 
 Keep all four files in the same folder — the HTML loads the others by
 relative path.
@@ -46,7 +46,7 @@ relative path.
   the badge via Free Draw mode. Long text can be scrolled from the browser
   side ("Software scroll") by re-sending shifted frames, since the device's
   own proprietary text-upload format isn't fully cracked yet (see
-  `protocol.md`).
+  `PROTOCOL.md`).
 - **Draw** — a 12×48 pixel canvas. Every stroke is sent to the badge live, in
   real time, as you draw (matching the behavior of the original `pyFreeDraw.py`
   script). Save/load your drawing as a PNG.
@@ -74,12 +74,12 @@ badges support, which blocks the browser's own `gatt.connect()`. Steps:
 
 ## Extending the library
 
-Every device command in `ledshow.js` is a one-line wrapper around two
-generic methods:
+Every normal device command in `static/ledshow.js` is a wrapper around one of
+these generic methods:
 
 ```js
-async send(hex)     // writes to the command characteristic (0xA951)
-async sendBuf(hex)  // writes to the buffer characteristic (0xA952)
+await led.send(cmdGrp, cmdId, [payloadBytes]);       // CMD characteristic (0xA951)
+await led.sendBuf(cmdGrp, cmdId, [payloadBytes]);    // BUFFER characteristic (0xA952)
 ```
 
 If you reverse-engineer a new command from a BLE sniff, you don't need to
@@ -87,33 +87,47 @@ touch any connection or queuing logic — just add:
 
 ```js
 async someNewFeature(v) {
-  await this.send(`AABBCCDD${v.toString(16).padStart(2,'0')}...`);
+  await this.send(0xAA, 0xBB, [v]);
 }
 ```
 
-You can also call `led.send('...')` directly from the browser console to
-test a raw hex payload before wrapping it in a proper method.
+You can also call `led.send(0xAA, 0xBB, [0x01, 0x02])` directly from the
+browser console to test a command before wrapping it in a method. The
+library builds the packet envelope and CRC automatically.
 
 ## Known limitations
 
-- **Custom text upload protocol is unconfirmed.** The device has its own
-  proprietary way of uploading a text bitmap (seen in captures as an
-  "Upload Start" + bitmap-buffer + "Select" sequence), which would let text
-  scroll/animate natively on-device. That encoding hasn't been cracked yet —
-  see `protocol.md` for the raw captures and what's known so far. Until then,
-  text is rendered client-side and pushed through Free Draw mode instead.
-- **Spectrogram preview matches the device exactly, not just approximately.**
-  A real BLE capture confirmed the badge takes exactly 12 bar values (0–8)
+- Native bitmap upload is implemented. The library encodes 12×48 bitmaps,
+  calculates CRC-32C/Castagnoli, handles upload acknowledgements, sends the
+  special bitmap buffer packet, activates the uploaded program, and closes the
+  special session.
+- Text normally uses browser-side rendering and Free Draw mode because the
+  badge's native text commands are separate from the confirmed bitmap-upload
+  protocol.
+- Spectogram confirmed. The badge takes exactly 12 bar values (0–8)
   plus a mode byte the device itself uses to choose between bottom-up and
   center-symmetric rendering — so the app's "Bottom"/"Center" toggle tells
   the physical badge which layout to draw natively, rather than being a
   local-only preview choice.
-- Free Draw sends one BLE write per pixel (up to 576 per full frame), so a
-  full-canvas redraw takes a couple of seconds — this is a hardware/protocol
-  limit, not something the app can batch around.
+- Free Draw sends one BLE write per pixel, up to 576 writes for a complete
+  12×48 frame.
 
 ## Disclaimer
 
 This is unofficial, reverse-engineered software for a device with no public
 protocol documentation. It isn't affiliated with the badge manufacturer.
 Use at your own risk.
+
+## Reverse-engineered protocol status
+
+The library uses two checksums:
+
+- **CRC-16/MODBUS** protects normal command packets and the special bitmap
+  buffer packet.
+- **CRC-32C/Castagnoli** protects the encoded native bitmap data.
+
+Native bitmap upload uses a special session. It is not the same as the
+spectrogram preview or other commands, they send different data frames.
+
+The library searches all reachable primary GATT services because badge models
+may expose their characteristics under different services.

@@ -36,7 +36,7 @@
     <div class="tab-panel active" id="panel-text">
       <div>
         <div class="section-title">Message</div>
-        <textarea id="text-input" rows="2" placeholder="Type your message…"></textarea>
+        <input  id="text-input" maxlength="32" placeholder="Type your message…">
       </div>
       <div>
         <div class="section-title">Effect</div>
@@ -45,12 +45,12 @@
       <div class="settings-card">
         <div class="section-title">Settings</div>
         <div class="slider-row">
-          <div class="slider-label"><span>Brightness</span><span id="lbl-text-bright">180</span></div>
-          <input type="range" min="0" max="255" value="180" id="sl-text-bright">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-text-bright">100%</span></div>
+          <input type="range" min="0" max="100" value="100" id="sl-text-bright">
         </div>
         <div class="slider-row">
-          <div class="slider-label"><span>Device speed</span><span id="lbl-text-speed">100</span></div>
-          <input type="range" min="0" max="255" value="100" id="sl-text-speed">
+          <div class="slider-label"><span>Device speed</span><span id="lbl-text-speed">100%</span></div>
+          <input type="range" min="0" max="100" value="100" id="sl-text-speed">
         </div>
       </div>
       <button class="send-btn" id="btn-send-text" disabled>▶ SEND</button>
@@ -77,12 +77,12 @@
       <div class="settings-card">
         <div class="section-title">Settings</div>
         <div class="slider-row">
-          <div class="slider-label"><span>Brightness</span><span id="lbl-draw-bright">180</span></div>
-          <input type="range" min="0" max="255" value="180" id="sl-draw-bright">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-draw-bright">100%</span></div>
+          <input type="range" min="0" max="100" value="100" id="sl-draw-bright">
         </div>
         <div class="slider-row">
-          <div class="slider-label"><span>Device speed</span><span id="lbl-draw-speed">100</span></div>
-          <input type="range" min="0" max="255" value="100" id="sl-draw-speed">
+          <div class="slider-label"><span>Device speed</span><span id="lbl-draw-speed">100%</span></div>
+          <input type="range" min="0" max="100" value="100" id="sl-draw-speed">
         </div>
       </div>
       <button class="send-btn" id="btn-send-draw" disabled>▶ Apply effect</button>
@@ -97,8 +97,8 @@
       <div class="settings-card">
         <div class="section-title">Settings</div>
         <div class="slider-row">
-          <div class="slider-label"><span>Brightness</span><span id="lbl-anim-bright">180</span></div>
-          <input type="range" min="0" max="255" value="180" id="sl-anim-bright">
+          <div class="slider-label"><span>Brightness</span><span id="lbl-anim-bright">100%</span></div>
+          <input type="range" min="0" max="100" value="100" id="sl-anim-bright">
         </div>
       </div>
     </div>
@@ -127,27 +127,11 @@
           </div>
         </div>
         <div class="slider-row">
-          <div class="slider-label"><span>Sensitivity</span><span id="lbl-music-gain">5</span></div>
+          <div class="slider-label"><span>Sensitivity</span><span id="lbl-music-gain">5x</span></div>
           <input type="range" min="1" max="10" value="5" id="sl-music-gain">
         </div>
       </div>
       <button class="send-btn stop" id="btn-stop-music" style="display:none">■ STOP</button>
-    </div>
-
-    <!-- HELP -->
-    <div class="tab-panel" id="panel-help">
-      <div class="section-title">About this app</div>
-      <div class="help-text">
-        <p><b>Requirements:</b> Chrome or Edge, desktop or Android, served over <b>HTTPS or localhost</b> (Web Bluetooth won't work over plain http:// or on iOS Safari).</p>
-        <br>
-        <p><b>Protocol:</b> this talks directly to the badge's GATT service (advertised UUID <span style="color:var(--text)">0xFFE0</span>) using the write characteristic <span style="color:var(--text)">0xA951</span> for commands and <span style="color:var(--text)">0xA952</span> for brightness/speed buffers, exactly as reverse-engineered in your <span style="color:var(--text)">pyHack.py</span> capture.</p>
-        <br>
-        <p><b>Text & Free Draw</b> both work by rasterizing content to a 12×48 bitmap in the browser and pushing it pixel-by-pixel through Free Draw mode (<span style="color:var(--text)">0x0301…</span> + per-pixel <span style="color:var(--text)">0x0302…</span> writes) — the same mechanism your pyFreeDraw.py used. The device's own proprietary "upload custom font" packet format (seen commented out in pyHack.py) wasn't fully reverse-engineered, so it isn't used here; instead, long text can be scrolled from the browser side by re-sending shifted frames — enable <b>"Software scroll"</b> on the Text tab.</p>
-        <br>
-        <p><b>Animations</b> (0–18) and the <b>Audio Spectrogram</b> mode use the manufacturer's built-in device commands directly.</p>
-        <br>
-        <p>Free Draw sends ~576 individual BLE writes per frame (one per pixel), so each send takes a couple of seconds — this matches the timing your original scripts used.</p>
-      </div>
     </div>
 
   </div>
@@ -157,7 +141,6 @@
     <button class="tab-btn" data-tab="draw"><span class="tab-icon">✎</span>Draw</button>
     <button class="tab-btn" data-tab="anim"><span class="tab-icon">★</span>Anim</button>
     <button class="tab-btn" data-tab="music"><span class="tab-icon">♫</span>Music</button>
-    <button class="tab-btn" data-tab="help"><span class="tab-icon">?</span>Help</button>
   </div>
 </div>
 

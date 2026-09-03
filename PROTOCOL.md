@@ -51,63 +51,60 @@ history / changelog if working from a fork.)
 
 ## Command packet format
 
-Confirmed from a real BLE HCI snoop capture (100+ samples across every
-command type below, cross-checked byte-for-byte). Every command sent on
-either `CMD` (`0xA951`) or `BUFFER` (`0xA952`) uses the **same envelope**,
-with no fixed size and no zero-padding:
+All normal commands sent through `CMD` (`0xA951`) use this envelope.
+Generic commands sent through `BUFFER` (`0xA952`) use the same envelope.
 
-```
-byte:    0        1        2      3      4 .. 4+N-1     4+N   5+N
-        [CMD_GRP][CMD_ID][   LEN (N), big-endian  ][   PAYLOAD (N bytes)   ][    CRC16    ]
-```
+Native bitmap data is an exception. It uses the special buffer packet format
+described in the bitmap-upload section.
 
-- **Byte 0 (`CMD_GRP`)**: command group/family — `0x00`, `0x01`, `0x03`,
-  `0x04`, `0x05`, or `0x06` (see command reference below).
-- **Byte 1 (`CMD_ID`)**: sub-command within that group.
-- **Bytes 2–3 (`LEN`)**: payload length as a big-endian `uint16` — i.e.
-  byte 2 is the *high* byte (`00 0d` = 13, `00 01` = 1). An earlier draft
-  of this doc had this backwards as little-endian; every real captured
-  value only makes sense as big-endian once you check it against the
-  payload that actually follows.
-- **Bytes 4..4+N-1 (`PAYLOAD`)**: exactly `N` bytes, `N` = the `LEN` field.
-  No padding before or after — total packet size is always `6 + N` bytes.
-- **Last 2 bytes (`CRC16`)**: checksum over everything before it (bytes
-  `0` through `3+N`, i.e. `CMD_GRP`+`CMD_ID`+`LEN`+`PAYLOAD`), appended
-  **big-endian** (high byte first). This was the single biggest unlock in
-  this whole reverse-engineering effort — see below.
-
-### The CRC
-
-**CRC-16/MODBUS**: polynomial `0x8005` reflected (`0xA001`), init `0xFFFF`,
-no final XOR. Verified against every command type this library sends,
-including all 19 previously-mysterious per-animation "hash" values (see
-`animate()` below) and the previously-unexplained trailing bytes of the
-`Upload Start` command — both turned out to just be this same CRC, not
-opaque lookup data.
-
-Dependency-free JS implementation (see `ledshow.js`):
-
-```js
-function crc16modbus(bytes) {
-  let crc = 0xFFFF;
-  for (const b of bytes) {
-    crc ^= b;
-    for (let i = 0; i < 8; i++) {
-      crc = (crc & 1) ? ((crc >>> 1) ^ 0xA001) : (crc >>> 1);
-    }
-  }
-  return crc & 0xFFFF; // append as [ (crc>>8)&0xff, crc&0xff ] — high byte first
-}
+```text
+[CMD_GRP][CMD_ID][LEN:2 BE][PAYLOAD][CRC16:2 BE]
 ```
 
-This one packet builder (`opcode(2) + len(2) + payload + crc(2)`) replaces
-what an earlier version of this doc described as fixed 16-byte
-zero-padded packets with "magic" constants. Those old captures (from
-`pyHack.py` / the original `ledshow.js`) weren't wrong about the working
-byte prefixes — they just had extra harmless zero padding tacked on
-instead of a real checksum, which the device apparently tolerates for
-simple commands. The format above is what the official app actually sends
-and is what this library now generates.
+The packet length is `6 + LEN` bytes. `CRC16` is calculated over the group,
+ID, length, and payload. It is appended in big-endian order.
+
+### CRC-16/MODBUS
+
+The packet checksum is CRC-16/MODBUS:
+
+- Reflected polynomial: `0xA001`
+- Initial value: `0xFFFF`
+- Final XOR: `0x0000`
+- Byte order: big-endian
+
+This checksum is used by the generic command packet builder in
+`static/ledshow.js`.
+
+### `0x05 0x03` — Play built-in animation
+
+The current library sends:
+
+```text
+[INDEX, 0x00, 0x00, 0x64]
+```
+
+`INDEX` is validated from `0` to `18`. The meaning of the remaining fixed
+bytes is not confirmed.
+
+### `0x06 0x01` — Spectrogram session start/stop
+
+This command controls the special spectrogram streaming session.
+
+- Payload `[0x01]`: start session
+- Payload `[0x00]`: stop session
+
+A spectrogram stream must be started with `0x06 0x01` before sending
+`0x06 0x02` frames.
+
+The native bitmap upload sequence does **not** use this command.
+
+### `0x01 0x04` on `BUFFER` — Unconfirmed legacy bitmap format
+
+This is a separate bitmap format observed in one capture. Its payload structure
+has not been decoded and it is not used by the current library.
+
+The implemented native upload uses a different special `BUFFER` packet.
 
 ## Command reference
 
@@ -194,7 +191,7 @@ upload finishes).
 
 ### `0x05 0x03` — Play built-in animation
 
-- **Payload** (4 bytes): `[ INDEX, 0x01, 0x64, 0x64 ]`
+- **Payload** (4 bytes): `[ INDEX, 0x00, 0x00, 0x64 ]`
 - `INDEX`: 0–18 (19 built-in animations)
 - **Example** (index=7): `05 03 00 04 07 01 64 64 6b 39`
 - Confirmed via extensive live testing. The trailing `01 64 64` is a fixed
@@ -236,123 +233,87 @@ upload, and the stop variant after.
   01 01 01 01 01 01 01 e7 c4`
 - Must be preceded by `0x06 0x01` (session start).
 
-### `0x01 0x04` on `BUFFER` (`0xA952`) — Bitmap matrix data (unconfirmed encoding)
+### Native bitmap buffer packet on `BUFFER` (`0xA952`)
 
-Part of the same upload sequence as `0x04 0x01` above (config) and
-`0x01 0x02` (activate). The packet envelope is confirmed — opcode, length
-field, and CRC all check out against a real 109-byte capture — but the
-**payload's internal structure is not decoded**:
+The implementation uses a special packet, not the generic command envelope:
 
-- Total captured packet: 109 bytes. `LEN` field declares `0x0100` = 256,
-  but only 103 payload bytes are actually present in this single write —
-  same oversized-length pattern seen in the old `Upload Start` captures
-  (see below), suggesting the true content may be intended to span
-  multiple `BUFFER` writes and this is only the first/only chunk of a
-  larger declared size, OR `LEN` here is a fixed allocation-size constant
-  unrelated to actual bytes sent. Not enough samples to tell which.
-- Interpreting the payload as 16-bit big-endian "column" words (the
-  technique that successfully decoded the separate `Upload Start` bitmap
-  below) does **not** produce a clean image here — only ~22 of ~50 words
-  are non-zero, and the leading bytes look more like a repeating
-  header/table (`00 00 60 00 00 00 60 00 ...`) than dense pixel data. This
-  payload may mix a geometry/offset table with sparse pixel data, similar
-  in spirit to the "table of bitmap offsets" approach used by unrelated
-  badge families (see the comparison table further down) — but this is
-  speculation, not a decode.
-- **Not used by this app** — bitmap/text content is still sent through the
-  confirmed, working Free Draw path (`0x03 0x01` + repeated `0x03 0x02`)
-  instead.
-
-## Unconfirmed: custom text/bitmap upload payload semantics
-
-The device has a proprietary way of uploading bitmap content — either
-through the `0x02 0x01` / `0x01 0x04` command pairing (two real captures
-exist) or, per the newer capture, the `0x04 0x01` + `BUFFER 0x01 0x04` +
-`0x01 0x02` sequence documented above. Two things used to block this;
-**one is now solved**:
-
-- **Solved: the checksum.** What looked like an opaque per-upload
-  checksum in `Upload Start` (`0x02 0x01`) is just the same CRC-16/MODBUS
-  used everywhere else in the protocol (see "Command packet format"
-  above). This was the original blocker — it's no longer one. Any new
-  `Upload Start`/config/bitmap packet can now be constructed with a
-  correct, device-accepted CRC.
-- ❌ **Still open: what the payload bytes mean.** Knowing the CRC doesn't
-  tell us what values to put in the payload for new content. Two
-  different upload-family payloads have been examined and neither is
-  fully decoded — see below.
-
-### `0x02 0x01` (`Upload Start`) + bitmap buffer — column encoding partially decoded
-
-```
-02 01 00 0a  <10-byte payload>  <CRC16>
+```text
+01 02 <SLOT> 00 00 <LEN:2 BE> 00 00 <LEN:2 BE> <BITMAP DATA> <CRC16>
 ```
 
-Two real captures (now byte-corrected using the confirmed CRC):
+`LEN` is the length of the encoded bitmap data. The packet is built by
+`LedShow._bufferBitmapPacket()`. The CRC16 covers the complete special header
+and bitmap data, excluding the CRC bytes.
+
+### `0x02 0x01` (`Upload Start`) + native `BUFFER` bitmap packet +
+`0x01 0x02` (activate)
+
+-- **No Session Start/Stop is involved.** `uploadBitmap()` does not call
+  `sessionStart()` or `sessionStop()`. Those commands are used for the
+  spectrogram stream only.
+
+### `0x02 0x01` (`Upload Start`) + `BUFFER` bitmap chunk + `0x01 0x02` (activate) — **complete real working sequence captured**
 
 ```
-02 01 00 0a 00 bb 01 64 64 8c 58 3d 32 00 50 a7
-02 01 00 0a 00 77 01 64 64 46 ba be c6 00 15 bb
+1. CMD    (0xA951): 02 01 00 0a  <10-byte payload>            <CRC16>   -- Upload Start
+   NOTIFY (0xA953): 02 01 00 01  <1-byte status>               <CRC16>   -- device ACK
+2. BUFFER (0xA952): 01 02 01 00  00 <LEN:2 BE> 00 00 <LEN:2 BE> <payload> <CRC16>  -- bitmap chunk
+   NOTIFY (0xA953): (9 bytes, format not fully decoded)                   -- device ACK
+3. CMD    (0xA951): 01 02 00 01  01                            <CRC16>   -- Set Active Program
+   NOTIFY (0xA953): 01 02 00 01  01                            <CRC16>   -- device echoes it back
 ```
 
-Applying the "1 bit per LED, packed into 16-bit words, MSB-first = top row"
-technique (borrowed from an unrelated badge's reverse-engineering writeup
-— see the comparison table above) to the accompanying bitmap-buffer
-payload from one of these captures produces a clean, clearly-not-random,
-symmetric shape — three repeated blocks that look like the same small
-icon/emoji:
+This is no longer a hypothesis — it's a **complete real capture** of the
+official app successfully performing an upload, including the device's
+own ACK notifications at every step (something no earlier capture had).
+A few things this settles:
+
+- **No Session Start/Stop involved.** An earlier version of this library's
+  `uploadBitmap()` wrapped the sequence in `sessionStart()`/`sessionStop()`
+  (`0x06 0x01`) based on a different capture's inline note that session
+  start was "valid also for bitmap". This real, complete, successful
+  sequence contains **no `0x06 0x01` traffic at all**. That assumption was
+  wrong and has been removed from the library.
+- **The device does ACK Upload Start explicitly**: `02 01 00 01 01 6c 9c`
+  — same opcode echoed back, 1-byte payload, `0x01` = accepted. (An
+  earlier, different single-shot capture showed status `0x03` on what
+  looked like a rejected/aborted attempt — consistent with this being a
+  real status code, not filler.) `ledshow.js` now listens on `NOTIFY`
+  (`0xA953`) and checks this byte, throwing a clear error if the device
+  reports anything other than `0x01`, instead of silently hoping the
+  write worked.
+- **`Set Active Program`'s ACK just echoes the command** — not very
+  informative on its own, but confirms the device processed it.
+- **The Buffer chunk's ACK** (`01 01 00 00 00 01 01 00 00`, 9 bytes)
+  doesn't decode cleanly against the generic envelope and isn't otherwise
+  understood — `ledshow.js` just drains it (records that *something* came
+  back) rather than trying to interpret it.
+
+**`Upload Start`'s payload — mostly mapped now, one field still open:**
 
 ```
-..##..##.............##.............##..##.........
-..##..##.............##.....###.....##..##.........
-..#####.............####.....##......####..........
-.............................##....................
-..........#####..............##....................
-.........##...##.............##....................
-#........##...##.#...........##...#................
-#........#######.#...........##...#................
-.........##..................##....................
-###......##...##...###.......##....................
-.##.......####......##......####...................
-.##.................##.............................
-.##.................##..............####...........
-.#####..............##.............##..##..........
-.##..##.#...........##...#.........##..##.#........
-.##..##.#...........##...#.........##..##.#........
+02 01 00 0a <BITMAP LEN:2 BE> <EFFECT> <SPEED> <BRIGHT> <BITMAP CRC32C> 00 <CRC16>
 ```
-
-That's good evidence for the general column-word technique, but the
-`Upload Start` payload's own field boundaries are still unclear: `01 64
-64` recurs in both captures (possibly a fixed marker, similar to
-`animate()`'s trailing constant), and the 2 bytes before it (`00 bb` /
-`00 77`) look like a length reference but don't obviously match the
-accompanying buffer's actual byte count. Not enough samples to pin down
-precisely.
-
-### `0x04 0x01` + `BUFFER 0x01 0x04` — different-looking payload, not decoded
-
-The newer capture's upload flow uses a differently-shaped bitmap payload
-(see the `0x01 0x04` entry in the command reference above) that does
-**not** decode cleanly with the same column-word technique — it looks more
-like a header/table mixed with sparse data. Whether this is really a
-different content type (e.g. a stored animation slot vs. custom text) or
-a different encoding for the same kind of content isn't known.
-
-### What would unblock this
-
-More real captures, ideally systematic ones: the same short upload
-repeated identically (sanity check — same input should give byte-identical
-output), then single-character changes one at a time, for **both** upload
-families above. With the CRC no longer in the way, any hypothesis can now
-be tested by constructing a real packet and sending it to the device to
-see what renders — trial and error against real hardware is viable now in
-a way it wasn't before.
-
-Until this is resolved, this app does not use either native upload path;
-text and drawings are sent through the confirmed, working Free Draw path
-instead (see the README's "Known limitations" section).
+- `BITMAP LEN` (bytes 0–1): confirmed — always exactly matches the accompanying
+  `EFFECT`(byte 2):  `0x00` to `0x7` for effects type
+- `SPEED` (byte 3): `0x00` to `0x64` for 0% to 100%
+- `BRIGHT` (byte 4): `0x00` to `0x64` for 0% to 100%
+- `BITMAP CRC32C` (byte 5-8): CRC32C of next encoded bitmap buffer
+- Final byte: constant `0x00` across all three samples.
 
 
+#### Implementation status
+
+`static/ledshow.js` implements the complete native bitmap upload flow,
+including:
+
+- `encodeBitmap12()`
+- CRC-32C/Castagnoli calculation
+- Upload Start acknowledgement handling
+- The special bitmap `BUFFER` packet
+- Buffer acknowledgement handling
+- Program activation
+- Session start and session stop
 ## Confirmed working values quick-reference
 
 | Constant | Value |
@@ -360,8 +321,9 @@ instead (see the README's "Known limitations" section).
 | Grid size | 12 rows × 48 columns |
 | Packet envelope | `CMD_GRP(1) + CMD_ID(1) + LEN(2, big-endian) + PAYLOAD(LEN) + CRC16(2, big-endian)` |
 | CRC algorithm | CRC-16/MODBUS (poly `0x8005` reflected, init `0xFFFF`, no xorout) |
+| CRC algorithm | CRC-32/CASTAGNOLI (for bitmap encode) |
 | Animation indices | 0–18 (19 total) |
 | Effect indices | 0–7 (Static, Left, Right, Up, Down, Snow, Scroll, Laser) |
-| Brightness range | 0–255 |
-| Speed range | 0–255 |
+| Brightness range | 100 |
+| Speed range | 100 |
 | Spectrogram bars per frame | **12**, each 0–8, plus 1 mode byte (0=bottom, 1=center) |
